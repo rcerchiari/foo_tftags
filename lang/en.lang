@@ -1,0 +1,36 @@
+# foo_tftags - English (template for translators)
+# Copy this file to <code>.lang (for example de.lang or zh-CN.lang) and translate the text after "=".
+# Use UTF-8. \n is a line break, {0} and {1} are placeholders. Lines starting with # are comments.
+# Missing keys fall back to English.
+name_label=Tag name (the field is always prefixed with tf_):
+script_label=Titleformat script:
+use_in_tf=Use in title formatting:
+note_1=Scripts may use other slots (%tf_artist%); circular references are refused when you press Apply.
+note_3=Changing a tag name asks to restart foobar2000 when you press Apply; script changes apply at once.
+cycle_apply=Circular reference between slots: {0}\n\nNothing was applied. Remove the reference and press Apply again.
+cycle_test=Circular reference between slots: {0}
+broken_scripts=These scripts do not compile, so their fields will be empty:{0}\n\nApply anyway?
+restart_prompt=A tag name was changed. foobar2000 reads field names at startup, so the new names only take effect after a restart.\n\nRestart foobar2000 now?
+test_no_track=Select a track in the playlist (or start playback) and try again.
+test_empty_script=(empty script or the script does not compile)
+test_empty_result=(empty result)
+language_name=English
+preview_label=Preview:
+editor_title=Titleformat script
+editor_discard=Discard your changes to the script?
+btn_cancel=Cancel
+import_button=Import...
+export_button=Export...
+import_title=Import settings
+export_title=Export settings
+filter_settings=TF Tags settings (*.tftags)
+filter_all=All files (*.*)
+import_confirm=Replace the tag names and scripts of the slots in this file with the imported settings?\n\nThey are applied when you press Apply.
+import_invalid=This is not a TF Tags settings file.
+import_failed=The settings file could not be read.
+export_failed=The settings file could not be written.
+lang_label=Language:
+lang_auto=Automatic (Windows display language)
+btn_yes=Yes
+btn_no=No
+btn_ok=OK
