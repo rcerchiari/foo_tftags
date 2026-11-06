@@ -1,6 +1,6 @@
 // foo_tftags - publishes long titleformat scripts as global tag fields.
 //
-// Twenty slots. Each slot has a tag name and a titleformat script. The result of the script is
+// Any number of slots. Each slot has a tag name and a titleformat script. The result of the script is
 // exposed to every component that evaluates title formatting as %tf_<name>%, for example
 //   slot name "albumartist"  ->  %tf_albumartist%
 // Scripts may be written over several lines: line breaks and leading indentation are removed
@@ -26,14 +26,18 @@
 #include <cstdint>
 #include <mutex>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <cstring>
 #include <string>
+#include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <uxtheme.h>
 
 #ifndef WM_DPICHANGED
@@ -46,14 +50,15 @@
 #pragma comment(lib, "UxTheme.lib")
 #pragma comment(lib, "Comctl32.lib")
 #pragma comment(lib, "Comdlg32.lib")
+#pragma comment(lib, "Shell32.lib")
 
-DECLARE_COMPONENT_VERSION("TF Tags", "0.1.1",
+DECLARE_COMPONENT_VERSION("TF Tags", "0.1.2",
     "Publishes long titleformat scripts as global tag fields (%tf_<name>%).");
 VALIDATE_COMPONENT_FILENAME("foo_tftags.dll");
 
 namespace {
 
-    constexpr size_t kSlots = 20;
+    constexpr size_t kLegacySlots = 20;  // older versions had 20 fixed slots
     constexpr const char* kFieldPrefix = "tf_";
 
     GUID makeGuid(std::uint32_t data1, std::uint8_t last) {
@@ -67,17 +72,22 @@ namespace {
     struct SlotConfig {
         GUID nameGuid;
         GUID scriptGuid;
+        GUID tableGuid;
         cfg_string name;
         cfg_string script;
+        cfg_string table;  // name of the replacement table (tables\<name>.json), "" = none
         SlotConfig(unsigned index, const char* defaultName, const char* defaultScript)
             : nameGuid(makeGuid(0x6f1c4a00u + index, 0x01)),
             scriptGuid(makeGuid(0x6f1c4b00u + index, 0x02)),
+            tableGuid(makeGuid(0x6f1c4c10u + index, 0x05)),
             name(nameGuid, defaultName),
-            script(scriptGuid, defaultScript) {
+            script(scriptGuid, defaultScript),
+            table(tableGuid, "") {
         }
     };
 
-    SlotConfig g_slots[kSlots] = {
+    // Only read to carry over the settings of older versions; slots are saved in g_slotsBlob now.
+    SlotConfig g_legacySlots[kLegacySlots] = {
         SlotConfig(0, "01", ""),
         SlotConfig(1, "02", ""),
         SlotConfig(2, "03", ""),
@@ -103,12 +113,128 @@ namespace {
     // Language override ("" = follow the Windows display language, otherwise the code of a lang\<code>.lang file).
     cfg_string g_language(makeGuid(0x6f1c4c00u, 0x03), "");
 
-    // Thread-safe copy of the scripts. Other threads (panels, search, background rendering)
+    // ---- the slots: any number, saved as one text blob
+    struct SlotData {
+        std::uint32_t id = 0;  // stable: the registered field keeps pointing at its slot after edits
+        std::string name;
+        std::string script;    // LF line breaks
+        std::string table;     // replacement table name, "" = none
+    };
+
+    cfg_string g_slotsBlob(makeGuid(0x6f1c4e00u, 0x07), "");
+
+    std::string stripCr(const std::string& text) {
+        std::string out;
+        out.reserve(text.size());
+        for (char c : text)
+            if (c != '\r') out += c;
+        return out;
+    }
+
+    std::string escapeBlob(const std::string& text) {
+        std::string out;
+        for (char c : text) {
+            if (c == '\\') out += "\\\\";
+            else if (c == '\n') out += "\\n";
+            else if (c != '\r') out += c;
+        }
+        return out;
+    }
+
+    std::string unescapeBlob(const std::string& text) {
+        std::string out;
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i] == '\\' && i + 1 < text.size()) {
+                if (text[i + 1] == 'n') { out += '\n'; ++i; continue; }
+                if (text[i + 1] == '\\') { out += '\\'; ++i; continue; }
+            }
+            out += text[i];
+        }
+        return out;
+    }
+
+    std::string serializeSlots(const std::vector<SlotData>& slots) {
+        std::string out = "v1\n";
+        for (const SlotData& s : slots) {
+            out += "id=" + std::to_string(s.id) + "\n";
+            out += "name=" + escapeBlob(s.name) + "\n";
+            out += "script=" + escapeBlob(s.script) + "\n";
+            out += "table=" + escapeBlob(s.table) + "\n";
+        }
+        return out;
+    }
+
+    std::vector<SlotData> parseSlots(const std::string& blob) {
+        std::vector<SlotData> slots;
+        size_t pos = 0;
+        while (pos < blob.size()) {
+            size_t end = blob.find('\n', pos);
+            if (end == std::string::npos) end = blob.size();
+            const std::string line = blob.substr(pos, end - pos);
+            pos = end + 1;
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string key = line.substr(0, eq);
+            const std::string value = unescapeBlob(line.substr(eq + 1));
+            if (key == "id") {
+                SlotData slot;
+                slot.id = (std::uint32_t)strtoul(value.c_str(), nullptr, 10);
+                slots.push_back(slot);
+            }
+            else if (!slots.empty()) {
+                if (key == "name") slots.back().name = value;
+                else if (key == "script") slots.back().script = value;
+                else if (key == "table") slots.back().table = value;
+            }
+        }
+        // ids must be unique and non-zero
+        std::unordered_set<std::uint32_t> seen;
+        std::uint32_t maxId = 0;
+        for (const SlotData& slot : slots) maxId = (std::max)(maxId, slot.id);
+        for (SlotData& slot : slots) {
+            if (slot.id == 0 || !seen.insert(slot.id).second) {
+                slot.id = ++maxId;
+                seen.insert(slot.id);
+            }
+        }
+        return slots;
+    }
+
+    // The saved slots, or the used slots of an older version, or one empty slot.
+    std::vector<SlotData> loadSlotsFromConfig() {
+        std::vector<SlotData> slots;
+        const char* blob = g_slotsBlob.get();
+        if (blob && *blob) {
+            slots = parseSlots(blob);
+        }
+        else {
+            for (size_t i = 0; i < kLegacySlots; ++i) {
+                const char* n = g_legacySlots[i].name.get();
+                const char* v = g_legacySlots[i].script.get();
+                const char* t = g_legacySlots[i].table.get();
+                SlotData slot;
+                slot.id = (std::uint32_t)(i + 1);
+                slot.name = n ? n : "";
+                slot.script = stripCr(v ? v : "");
+                slot.table = t ? t : "";
+                if (!slot.script.empty() || !slot.table.empty()) slots.push_back(slot);
+            }
+        }
+        if (slots.empty()) {
+            SlotData slot;
+            slot.id = 1;
+            slot.name = "01";
+            slots.push_back(slot);
+        }
+        return slots;
+    }
+
+    // Thread-safe copy of the slots. Other threads (panels, search, background rendering)
     // evaluate slots while the main thread applies preferences, so they never read the
     // cfg_string objects directly.
     struct ScriptStore {
         std::mutex m;
-        std::string scripts[kSlots];
+        std::vector<SlotData> slots;
         bool loaded = false;
     };
 
@@ -119,28 +245,40 @@ namespace {
 
     std::atomic<unsigned> g_scriptVersion{ 0 };
 
-    std::string getScript(size_t slot) {
-        ScriptStore& st = scriptStore();
-        std::lock_guard<std::mutex> lock(st.m);
-        if (!st.loaded) {
-            for (size_t i = 0; i < kSlots; ++i) {
-                const char* v = g_slots[i].script.get();
-                st.scripts[i] = v ? v : "";
-            }
-            st.loaded = true;
-        }
-        return st.scripts[slot];
+    void loadStoreLocked(ScriptStore& st) {
+        if (st.loaded) return;
+        st.slots = loadSlotsFromConfig();
+        st.loaded = true;
     }
 
-    // Main thread only: stores the scripts in the config and in the thread-safe copy.
-    void setScripts(const std::string* scripts) {
+    std::vector<SlotData> savedSlots() {
         ScriptStore& st = scriptStore();
         std::lock_guard<std::mutex> lock(st.m);
-        for (size_t i = 0; i < kSlots; ++i) {
-            g_slots[i].script = scripts[i].c_str();
-            st.scripts[i] = scripts[i];
+        loadStoreLocked(st);
+        return st.slots;
+    }
+
+    bool getSlotById(std::uint32_t id, std::string& script, std::string& table) {
+        ScriptStore& st = scriptStore();
+        std::lock_guard<std::mutex> lock(st.m);
+        loadStoreLocked(st);
+        for (const SlotData& slot : st.slots) {
+            if (slot.id == id) {
+                script = slot.script;
+                table = slot.table;
+                return true;
+            }
         }
+        return false;
+    }
+
+    // Main thread only: saves the slots in the config and in the thread-safe copy.
+    void setSlots(const std::vector<SlotData>& slots) {
+        ScriptStore& st = scriptStore();
+        std::lock_guard<std::mutex> lock(st.m);
+        st.slots = slots;
         st.loaded = true;
+        g_slotsBlob = serializeSlots(slots).c_str();
         ++g_scriptVersion;
     }
 
@@ -156,19 +294,28 @@ namespace {
         return out;
     }
 
-    // Field name for a slot, e.g. "tf_albumartist". Empty or duplicate names get a slot number.
-    std::string fieldNameFor(size_t index, const std::string* names /* kSlots entries, or null = saved */) {
-        auto nameOf = [&](size_t i) {
-            return cleanName(names ? names[i] : std::string(g_slots[i].name.get() ? g_slots[i].name.get() : ""));
-            };
-        std::string n = nameOf(index);
-        if (n.empty()) n = "slot" + std::to_string(index + 1);
-        for (size_t i = 0; i < index; ++i) {
-            std::string other = nameOf(i);
-            if (other.empty()) other = "slot" + std::to_string(i + 1);
-            if (other == n) { n += "_" + std::to_string(index + 1); break; }
+    // Field names of all slots, e.g. "tf_albumartist". Empty or duplicate names get a slot number.
+    std::vector<std::string> fieldNames(const std::vector<std::string>& names) {
+        std::vector<std::string> fields;
+        fields.reserve(names.size());
+        std::unordered_set<std::string> earlier;
+        for (size_t i = 0; i < names.size(); ++i) {
+            std::string base = cleanName(names[i]);
+            if (base.empty()) base = "slot" + std::to_string(i + 1);
+            fields.push_back(std::string(kFieldPrefix) + (earlier.count(base) ? base + "_" + std::to_string(i + 1) : base));
+            earlier.insert(base);
         }
-        return std::string(kFieldPrefix) + n;
+        return fields;
+    }
+
+    std::string fieldNameFor(size_t index, const std::vector<std::string>& names) {
+        return fieldNames(names)[index];
+    }
+
+    std::vector<std::string> savedFieldNames() {
+        std::vector<std::string> names;
+        for (const SlotData& slot : savedSlots()) names.push_back(slot.name);
+        return fieldNames(names);
     }
 
     // Make a multi-line script into the one-liner foobar2000 compiles: drop // comments (whole
@@ -205,12 +352,14 @@ namespace {
     // other slots). Scans every script for %tf_<name>% references (text inside 'quotes' is
     // literal and skipped) and searches the reference graph iteratively (no recursion).
     // Returns e.g. "tf_a -> tf_b -> tf_a", or an empty string when there is no cycle.
-    std::string findCycle(const std::string* names, const std::string* scripts) {
-        std::string field[kSlots];
-        std::vector<size_t> edges[kSlots];
-        for (size_t i = 0; i < kSlots; ++i) field[i] = fieldNameFor(i, names);
+    std::string findCycle(const std::vector<std::string>& names, const std::vector<std::string>& scripts) {
+        const size_t count = names.size();
+        const std::vector<std::string> field = fieldNames(names);
+        std::unordered_map<std::string, size_t> indexOf;
+        for (size_t i = 0; i < count; ++i) indexOf.emplace(field[i], i);
+        std::vector<std::vector<size_t>> edges(count);
 
-        for (size_t i = 0; i < kSlots; ++i) {
+        for (size_t i = 0; i < count; ++i) {
             const std::string flat = flattenScript(scripts[i]);
             bool quoted = false;
             for (size_t p = 0; p < flat.size(); ++p) {
@@ -221,16 +370,16 @@ namespace {
                 if (q == std::string::npos) break;
                 std::string token = flat.substr(p + 1, q - p - 1);
                 for (auto& ch : token) ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
-                for (size_t j = 0; j < kSlots; ++j)
-                    if (token == field[j] && std::find(edges[i].begin(), edges[i].end(), j) == edges[i].end())
-                        edges[i].push_back(j);
+                const auto hit = indexOf.find(token);
+                if (hit != indexOf.end() && std::find(edges[i].begin(), edges[i].end(), hit->second) == edges[i].end())
+                    edges[i].push_back(hit->second);
                 p = q;
             }
         }
 
-        for (size_t start = 0; start < kSlots; ++start) {
-            size_t parent[kSlots] = {};
-            bool seen[kSlots] = {};
+        for (size_t start = 0; start < count; ++start) {
+            std::vector<size_t> parent(count, 0);
+            std::vector<char> seen(count, 0);
             std::vector<size_t> queue;
             auto describe = [&](size_t last) {
                 std::vector<size_t> path;
@@ -243,119 +392,79 @@ namespace {
                 };
             for (size_t j : edges[start]) {
                 if (j == start) return field[start] + " -> " + field[start];
-                if (!seen[j]) { seen[j] = true; parent[j] = start; queue.push_back(j); }
+                if (!seen[j]) { seen[j] = 1; parent[j] = start; queue.push_back(j); }
             }
             for (size_t head = 0; head < queue.size(); ++head) {
                 const size_t u = queue[head];
                 for (size_t v : edges[u]) {
                     if (v == start) return describe(u);
-                    if (!seen[v]) { seen[v] = true; parent[v] = u; queue.push_back(v); }
+                    if (!seen[v]) { seen[v] = 1; parent[v] = u; queue.push_back(v); }
                 }
             }
         }
         return {};
     }
 
-    // ---------------------------------------------------------------- dynamic (ICY) metadata
-    // Same scheme as foo_countryflags: a playback callback remembers the playing track and
-    // whether its stream has delivered live metadata. While it has, the track is formatted by
-    // foobar2000's own playback formatting, which applies the live values to every field
-    // (%artist%, %title%, ...), so no field needs to be listed here and no hook is involved.
+    // ---------------------------------------------------------------- dynamic (ICY) metadata overlay
 
-    struct DynamicInfo {
+    using MetaValues = std::vector<std::string>;
+    using MetaList = std::vector<std::pair<std::string, MetaValues>>;
+
+    struct DynamicMetadata {
         std::mutex m;
         metadb_handle_ptr track;
-        bool live = false;
+        MetaList meta;
     };
 
-    DynamicInfo& dynamicInfo() {
-        static DynamicInfo* d = new DynamicInfo;
+    DynamicMetadata& dynamicMetadata() {
+        static DynamicMetadata* d = new DynamicMetadata;
         return *d;
     }
 
-    // The track a preview is evaluated for. A selected track always wins, even while another
-    // track is playing: the active playlist selection first, then the selection of any other
-    // panel (e.g. the library), then the focused playlist row. The playing track is only used
-    // when none of these exist.
-    metadb_handle_ptr pickPreviewTrack() {
-        metadb_handle_ptr playing;
-        playback_control::get()->get_now_playing(playing);
-        metadb_handle_list sel;
-        playlist_manager::get()->activeplaylist_get_selected_items(sel);
-        if (sel.get_count() == 0) ui_selection_manager::get()->get_selection(sel);
-        if (sel.get_count() > 0) return sel[0];
-        metadb_handle_ptr focused;
-        if (playlist_manager::get()->activeplaylist_get_focus_item_handle(focused) && focused.is_valid()) return focused;
-        return playing;
-    }
-
-    // Preview windows also poll the picked track at this interval, so a changed selection or
-    // focus refreshes them (those changes are not announced to plugins).
-    constexpr UINT kTrackWatchMs = 300;
-
-    // Preview windows (the preferences page and the script editor) register here and are told to
-    // refresh when the playing track, or its live stream metadata, changes.
-    constexpr UINT WM_TFTAGS_REFRESH_PREVIEW = WM_APP + 2;
-
-    struct PreviewTargets {
-        std::mutex m;
-        std::vector<HWND> wnds;
-    };
-
-    PreviewTargets& previewTargets() {
-        static PreviewTargets* t = new PreviewTargets;
-        return *t;
-    }
-
-    void registerPreviewWindow(HWND wnd) {
-        PreviewTargets& t = previewTargets();
-        std::lock_guard<std::mutex> lock(t.m);
-        if (std::find(t.wnds.begin(), t.wnds.end(), wnd) == t.wnds.end()) t.wnds.push_back(wnd);
-    }
-
-    void unregisterPreviewWindow(HWND wnd) {
-        PreviewTargets& t = previewTargets();
-        std::lock_guard<std::mutex> lock(t.m);
-        t.wnds.erase(std::remove(t.wnds.begin(), t.wnds.end(), wnd), t.wnds.end());
-    }
-
-    void notifyPreviewWindows() {
-        PreviewTargets& t = previewTargets();
-        std::lock_guard<std::mutex> lock(t.m);
-        for (HWND wnd : t.wnds) PostMessageW(wnd, WM_TFTAGS_REFRESH_PREVIEW, 0, 0);
-    }
-
-    class dynamic_info_callback : public play_callback_static {
+    class dynamic_metadata_callback : public play_callback_static {
     public:
         unsigned get_flags() override {
             return flag_on_playback_new_track | flag_on_playback_stop | flag_on_playback_dynamic_info_track;
         }
-        void on_playback_new_track(metadb_handle_ptr p_track) override {
-            DynamicInfo& d = dynamicInfo();
+
+        void on_playback_new_track(metadb_handle_ptr track) override {
+            DynamicMetadata& d = dynamicMetadata();
             {
                 std::lock_guard<std::mutex> lock(d.m);
-                d.track = p_track;
-                d.live = false;
+                d.track = track;
+                d.meta.clear();
             }
-            notifyPreviewWindows();
         }
+
         void on_playback_stop(play_control::t_stop_reason) override {
-            DynamicInfo& d = dynamicInfo();
+            DynamicMetadata& d = dynamicMetadata();
             {
                 std::lock_guard<std::mutex> lock(d.m);
                 d.track.release();
-                d.live = false;
+                d.meta.clear();
             }
-            notifyPreviewWindows();
         }
-        void on_playback_dynamic_info_track(const file_info& p_info) override {
-            DynamicInfo& d = dynamicInfo();
+
+        void on_playback_dynamic_info_track(const file_info& info) override {
+            MetaList meta;
+            const t_size total = info.meta_get_count();
+            for (t_size i = 0; i < total; ++i) {
+                const t_size values = info.meta_enum_value_count(i);
+                if (values == 0) continue;
+                std::string name = info.meta_enum_name(i);
+                for (auto& c : name) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                // Keep every value, like normal metadata fields.
+                MetaValues list;
+                for (t_size v = 0; v < values; ++v) list.emplace_back(info.meta_enum_value(i, v));
+                meta.emplace_back(std::move(name), std::move(list));
+            }
+            DynamicMetadata& d = dynamicMetadata();
             {
                 std::lock_guard<std::mutex> lock(d.m);
-                d.live = p_info.meta_get_count() > 0;
+                d.meta = std::move(meta);
             }
-            notifyPreviewWindows();
         }
+
         void on_playback_starting(play_control::t_track_command, bool) override {}
         void on_playback_seek(double) override {}
         void on_playback_pause(bool) override {}
@@ -364,25 +473,135 @@ namespace {
         void on_playback_time(double) override {}
         void on_volume_change(float) override {}
     };
-    play_callback_static_factory_t<dynamic_info_callback> g_dynamic_info_callback;
 
-    // True when h is the playing track and its stream has delivered live metadata.
-    bool hasLiveInfo(metadb_handle* h) {
-        DynamicInfo& d = dynamicInfo();
+    play_callback_static_factory_t<dynamic_metadata_callback> g_dynamic_metadata_callback;
+
+    // Live stream metadata (ICY etc.) of the playing track, if it has any. Only %field% and
+    // $meta(field[, n]), $meta_sep() and $meta_num() are overlaid; %isplaying% and everything
+    // else is left to foobar2000.
+    bool dynamicOverlayFor(metadb_handle* handle, MetaList& out) {
+        DynamicMetadata& d = dynamicMetadata();
         std::lock_guard<std::mutex> lock(d.m);
-        return d.live && d.track.is_valid() && d.track.get_ptr() == h;
+        if (!d.track.is_valid() || d.track.get_ptr() != handle || d.meta.empty()) return false;
+        out = d.meta;
+        return true;
     }
 
-    // Formats a track; the playing one with live stream metadata goes through playback
-    // formatting so every field reflects the live values. playback_format_title is only used on
-    // the main thread (the SDK does not promise it is thread-safe, and it formats whatever is
-    // playing at that moment); other threads get the track's normal tags.
-    void formatTrack(metadb_handle* h, pfc::string_base& out, const titleformat_object::ptr& script) {
-        if (core_api::is_main_thread() && hasLiveInfo(h) &&
-            playback_control::get()->playback_format_title(nullptr, out, script, nullptr, playback_control::display_level_all))
-            return;
-        h->format_title(nullptr, out, script, nullptr);
-    }
+    void applyTable(const std::string& name, std::string& value);   // defined with the tables below
+    std::vector<std::string> tableFields(const std::string& name);   // lower-case multi-value field names
+
+    // Hook used while a slot's script is formatted. It answers %field%, $meta(field[, n]),
+    // $meta_sep() and $meta_num() from (1) the live stream metadata of the playing track and
+    // (2) when the slot has a replacement table, the real values of the table's multi-value
+    // fields (ARTIST, GENRE, ... by default), replacing every value on its own. Everything else is
+    // left to foobar2000.
+    class slot_hook : public titleformat_hook {
+    public:
+        slot_hook(MetaList overlay, metadb_info_container::ptr info, const std::string& table) :
+            m_items(std::move(overlay)), m_info(std::move(info)), m_table(table) {
+            if (!m_table.empty())
+                for (const std::string& field : tableFields(m_table)) m_fields.insert(field);
+        }
+
+        // %field%: all values joined with ", " like foobar2000 does for multi-value fields.
+        bool process_field(titleformat_text_out* out, const char* name, t_size length,
+            bool& found) override {
+            MetaValues values;
+            if (!valuesFor(std::string(name, length), values)) return false;
+            write(out, join(values, ", ", ", "));
+            found = true;
+            return true;
+        }
+
+        // $meta(field), $meta(field, n), $meta_sep(field, sep [, lastsep]) and $meta_num(field).
+        bool process_function(titleformat_text_out* out, const char* name, t_size length,
+            titleformat_hook_function_params* params, bool& found) override {
+            const bool isMeta = length == 4 && _strnicmp(name, "meta", 4) == 0;
+            const bool isSep = length == 8 && _strnicmp(name, "meta_sep", 8) == 0;
+            const bool isNum = length == 8 && _strnicmp(name, "meta_num", 8) == 0;
+            if ((!isMeta && !isSep && !isNum) || params->get_param_count() < 1) return false;
+
+            const char* field = nullptr;
+            t_size fieldLength = 0;
+            params->get_param(0, field, fieldLength);
+            MetaValues values;
+            if (!valuesFor(std::string(field, fieldLength), values)) return false;
+
+            if (isNum) {
+                write(out, std::to_string(values.size()));
+                found = true;
+                return true;
+            }
+            if (isSep) {
+                if (params->get_param_count() < 2) return false;
+                const char* sep = nullptr;
+                t_size sepLength = 0;
+                params->get_param(1, sep, sepLength);
+                std::string last(sep, sepLength);
+                if (params->get_param_count() >= 3) {
+                    const char* lastSep = nullptr;
+                    t_size lastLength = 0;
+                    params->get_param(2, lastSep, lastLength);
+                    last.assign(lastSep, lastLength);
+                }
+                write(out, join(values, std::string(sep, sepLength), last));
+                found = true;
+                return true;
+            }
+            const t_size index = params->get_param_count() >= 2 ? params->get_param_uint(1) : 0;
+            if (index >= values.size()) {
+                found = false;  // the field exists, but not that many values
+                return true;
+            }
+            write(out, values[index]);
+            found = true;
+            return true;
+        }
+
+    private:
+        static void write(titleformat_text_out* out, const std::string& text) {
+            out->write(titleformat_inputtypes::meta, text.c_str(), text.length());
+        }
+
+        static std::string join(const MetaValues& values, const std::string& sep, const std::string& lastSep) {
+            std::string text;
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (i > 0) text += (i + 1 == values.size()) ? lastSep : sep;
+                text += values[i];
+            }
+            return text;
+        }
+
+        // The values of a field, or false to leave the field to foobar2000.
+        bool valuesFor(const std::string& name, MetaValues& out) const {
+            std::string key = name;
+            for (auto& c : key) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+            bool have = false;
+            for (const auto& item : m_items)
+                if (item.first == key) { out = item.second; have = true; break; }
+            const bool listed = !m_table.empty() && m_fields.count(key) > 0;
+            if (!have && listed && m_info.is_valid()) have = fileValues(key, out);
+            if (!have || out.empty()) return false;
+            if (listed)
+                for (std::string& value : out) applyTable(m_table, value);
+            return true;
+        }
+
+        bool fileValues(const std::string& key, MetaValues& out) const {
+            const file_info& info = m_info->info();
+            t_size index = info.meta_find(key.c_str());
+            if (index == pfc_infinite && key == "album artist") index = info.meta_find("albumartist");
+            if (index == pfc_infinite) return false;
+            const t_size count = info.meta_enum_value_count(index);
+            for (t_size v = 0; v < count; ++v) out.emplace_back(info.meta_enum_value(index, v));
+            return true;
+        }
+
+        MetaList m_items;
+        metadb_info_container::ptr m_info;
+        std::string m_table;
+        std::unordered_set<std::string> m_fields;
+    };
 
     // ---------------------------------------------------------------- evaluation
 
@@ -392,48 +611,67 @@ namespace {
         std::mutex m;
         unsigned version = 0;
         titleformat_object::ptr obj;
+        std::string table;
         bool init = false;
     };
 
-    ScriptCache& scriptCache(size_t slot) {
-        static ScriptCache* caches[kSlots] = {
-            new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache,
-            new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache,
-            new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache,
-            new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache, new ScriptCache
-        };
-        return *caches[slot];
+    struct CompiledSlot {
+        titleformat_object::ptr obj;
+        std::string table;
+    };
+
+    struct CacheMap {
+        std::mutex m;
+        std::unordered_map<std::uint32_t, ScriptCache*> map;
+    };
+
+    CacheMap& cacheMap() {
+        static CacheMap* caches = new CacheMap;
+        return *caches;
+    }
+
+    ScriptCache& scriptCache(std::uint32_t id) {
+        CacheMap& cm = cacheMap();
+        std::lock_guard<std::mutex> lock(cm.m);
+        ScriptCache*& cache = cm.map[id];
+        if (!cache) cache = new ScriptCache;
+        return *cache;
     }
 
     // A script that does not compile gives no object, so its field is empty.
-    titleformat_object::ptr compileScript(size_t slot) {
-        ScriptCache& c = scriptCache(slot);
+    CompiledSlot compileScript(std::uint32_t id) {
+        ScriptCache& c = scriptCache(id);
         const unsigned version = g_scriptVersion.load();
         {
             std::lock_guard<std::mutex> lock(c.m);
-            if (c.init && c.version == version) return c.obj;
+            if (c.init && c.version == version) return CompiledSlot{ c.obj, c.table };
         }
-        const std::string flat = flattenScript(getScript(slot));
+        std::string script, table;
+        if (!getSlotById(id, script, table)) return CompiledSlot{};  // the slot was removed
+        const std::string flat = flattenScript(script);
         titleformat_object::ptr obj;
         if (!flat.empty() && !titleformat_compiler::get()->compile(obj, flat.c_str())) obj.release();
         std::lock_guard<std::mutex> lock(c.m);
         c.obj = obj;
+        c.table = table;
         c.version = version;
         c.init = true;
-        return obj;
+        return CompiledSlot{ obj, table };
     }
 
     class script_cache_cleanup : public initquit {
     public:
         void on_quit() override {
             {
-                DynamicInfo& d = dynamicInfo();
+                DynamicMetadata& d = dynamicMetadata();
                 std::lock_guard<std::mutex> lock(d.m);
                 d.track.release();
-                d.live = false;
+                d.meta.clear();
             }
-            for (size_t i = 0; i < kSlots; ++i) {
-                ScriptCache& c = scriptCache(i);
+            CacheMap& cm = cacheMap();
+            std::lock_guard<std::mutex> mapLock(cm.m);
+            for (auto& entry : cm.map) {
+                ScriptCache& c = *entry.second;
                 std::lock_guard<std::mutex> lock(c.m);
                 c.obj.release();
                 c.init = false;
@@ -442,37 +680,472 @@ namespace {
     };
     initquit_factory_t<script_cache_cleanup> g_script_cache_cleanup;
 
+    // ---------------------------------------------------------------- replacement tables
+    // A table is a JSON file in <profile>\foo_tftags\tables\<name>.json that maps names to the
+    // value they should become: { "R.E.M.": ["REM", "R.E.M"], "T. Rex": "T REX" }. The key is
+    // the wanted result, the value is one name or a list of names that are replaced by it
+    // (whole value, case-insensitive). A slot can run its result through one table.
+    std::string foldCase(const std::string& text) {
+        if (text.empty()) return text;
+        pfc::stringcvt::string_wide_from_utf8 wide(text.c_str());
+        const std::wstring w(wide.get_ptr());
+        std::wstring lower(w.size(), L'\0');
+        const int n = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, w.c_str(), (int)w.size(),
+            &lower[0], (int)lower.size(), nullptr, nullptr, 0);
+        if (n <= 0) lower = w;
+        else lower.resize((size_t)n);
+        pfc::stringcvt::string_utf8_from_wide utf8(lower.c_str());
+        return std::string(utf8.get_ptr());
+    }
+
+    void appendUtf8(std::string& out, unsigned cp) {
+        if (cp < 0x80) out += static_cast<char>(cp);
+        else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else if (cp < 0x10000) {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+
+    // Minimal JSON reader for the flat shape above (strings, arrays of strings, one object).
+    class JsonReader {
+    public:
+        explicit JsonReader(const std::string& text) : m_s(text) {
+            if (m_s.compare(0, 3, "\xEF\xBB\xBF") == 0) m_pos = 3;
+        }
+
+        bool eat(char c) {
+            skip();
+            if (m_pos < m_s.size() && m_s[m_pos] == c) { ++m_pos; return true; }
+            return false;
+        }
+
+        bool peek(char c) {
+            skip();
+            return m_pos < m_s.size() && m_s[m_pos] == c;
+        }
+
+        bool atEnd() {
+            skip();
+            return m_pos >= m_s.size();
+        }
+
+        bool readString(std::string& out) {
+            out.clear();
+            if (!eat('"')) return false;
+            while (m_pos < m_s.size()) {
+                const char c = m_s[m_pos++];
+                if (c == '"') return true;
+                if (c != '\\') { out += c; continue; }
+                if (m_pos >= m_s.size()) return false;
+                const char e = m_s[m_pos++];
+                switch (e) {
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case 'u': {
+                    unsigned cp = 0;
+                    if (!hex4(cp)) return false;
+                    if (cp >= 0xD800 && cp < 0xDC00 && m_pos + 1 < m_s.size() && m_s[m_pos] == '\\' && m_s[m_pos + 1] == 'u') {
+                        const size_t save = m_pos;
+                        m_pos += 2;
+                        unsigned low = 0;
+                        if (hex4(low) && low >= 0xDC00 && low < 0xE000) cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                        else m_pos = save;
+                    }
+                    appendUtf8(out, cp);
+                    break;
+                }
+                default: return false;
+                }
+            }
+            return false;
+        }
+
+    private:
+        void skip() {
+            while (m_pos < m_s.size() && (m_s[m_pos] == ' ' || m_s[m_pos] == '\t' || m_s[m_pos] == '\r' || m_s[m_pos] == '\n')) ++m_pos;
+        }
+
+        bool hex4(unsigned& cp) {
+            if (m_pos + 4 > m_s.size()) return false;
+            cp = 0;
+            for (int k = 0; k < 4; ++k) {
+                const char h = m_s[m_pos++];
+                cp <<= 4;
+                if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
+                else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
+                else return false;
+            }
+            return true;
+        }
+
+        const std::string& m_s;
+        size_t m_pos = 0;
+    };
+
+    // Builds folded-name -> result. Every wanted result also maps to itself, which fixes its case.
+    bool parseTableJson(const std::string& json, std::unordered_map<std::string, std::string>& out,
+        std::vector<std::string>& separators, std::vector<std::string>& fields) {
+        JsonReader r(json);
+        if (!r.eat('{')) return false;
+        std::vector<std::string> targets;
+        bool sawSplit = false;
+        bool sawFields = false;
+        if (!r.eat('}')) {
+            for (;;) {
+                std::string target;
+                if (!r.readString(target) || !r.eat(':')) return false;
+                std::vector<std::string> sources;
+                if (r.peek('"')) {
+                    std::string one;
+                    if (!r.readString(one)) return false;
+                    sources.push_back(one);
+                }
+                else if (r.eat('[')) {
+                    if (!r.eat(']')) {
+                        for (;;) {
+                            std::string one;
+                            if (!r.readString(one)) return false;
+                            sources.push_back(one);
+                            if (r.eat(',')) continue;
+                            if (r.eat(']')) break;
+                            return false;
+                        }
+                    }
+                }
+                else return false;
+                if (target == "$split") {
+                    // Not a name: the separators that split a multi-value result into names.
+                    sawSplit = true;
+                    for (const std::string& source : sources)
+                        if (!source.empty()) separators.push_back(source);
+                }
+                else if (target == "$fields") {
+                    // Not a name: the multi-value tag fields whose values are replaced one by one.
+                    sawFields = true;
+                    for (const std::string& source : sources)
+                        if (!source.empty()) fields.push_back(foldCase(source));
+                }
+                else {
+                    for (const std::string& source : sources) out[foldCase(source)] = target;
+                    targets.push_back(target);
+                }
+                if (r.eat(',')) continue;
+                if (r.eat('}')) break;
+                return false;
+            }
+        }
+        if (!r.atEnd()) return false;
+        for (const std::string& target : targets) out.emplace(foldCase(target), target);
+        if (!sawSplit) separators.push_back(";");  // default: "Korn;Madonna" and "Korn; Madonna"
+        if (!sawFields) {
+            for (const char* field : { "artist", "album artist", "producer", "composer", "performer", "genre", "style", "country" })
+                fields.push_back(field);
+        }
+        return true;
+    }
+
+    bool validTableName(const std::string& name) {
+        return !name.empty() && name[0] != '.' && name.find_first_of("\\/:*?\"<>|") == std::string::npos;
+    }
+
+    std::wstring profileDirectory() {
+        pfc::string8 native;
+        try {
+            filesystem::g_get_native_path(core_api::get_profile_path(), native);
+        }
+        catch (...) {
+            return std::wstring();
+        }
+        pfc::stringcvt::string_wide_from_utf8 wide(native.c_str());
+        std::wstring dir(wide.get_ptr());
+        if (!dir.empty() && dir.back() != L'\\') dir += L'\\';
+        return dir;
+    }
+
+    // <profile>\foo_tftags\tables\ (with a trailing backslash), or empty when there is no profile.
+    std::wstring tablesDirectory(bool create) {
+        std::wstring dir = profileDirectory();
+        if (dir.empty()) return dir;
+        dir += L"foo_tftags\\";
+        if (create) CreateDirectoryW(dir.c_str(), nullptr);
+        dir += L"tables\\";
+        if (create) CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
+    }
+
+    std::vector<std::string> listTables() {
+        std::vector<std::string> names;
+        const std::wstring dir = tablesDirectory(false);
+        if (dir.empty()) return names;
+        WIN32_FIND_DATAW fd{};
+        HANDLE h = FindFirstFileW((dir + L"*.json").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return names;
+        do {
+            const std::wstring file = fd.cFileName;
+            if (file.size() <= 5 || (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+            pfc::stringcvt::string_utf8_from_wide utf8(file.substr(0, file.size() - 5).c_str());
+            const std::string name(utf8.get_ptr());
+            if (validTableName(name)) names.push_back(name);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        std::sort(names.begin(), names.end());
+        return names;
+    }
+
+    struct TableData {
+        std::unordered_map<std::string, std::string> map;
+        std::vector<std::string> separators;  // from the "$split" entry
+        std::vector<std::string> fields;      // from the "$fields" entry (lower case)
+        FILETIME stamp{};
+        DWORD lastCheck = 0;
+        bool loaded = false;
+        int state = 1;  // 0 = ok, 1 = file missing, 2 = not valid JSON of the expected shape
+    };
+
+    struct TableRegistry {
+        std::mutex m;
+        std::unordered_map<std::string, TableData> tables;
+    };
+
+    TableRegistry& tableRegistry() {
+        static TableRegistry* reg = new TableRegistry;
+        return *reg;
+    }
+
+    bool readTableFile(const std::wstring& path, std::string& out) {
+        FILE* f = nullptr;
+        if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return false;
+        char buf[8192];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+        fclose(f);
+        return true;
+    }
+
+    // Caller holds the registry lock. The file is checked at most every 2 seconds (always when
+    // `force`), so edits to a table are picked up without a restart.
+    TableData& refreshTable(TableRegistry& reg, const std::string& name, bool force) {
+        TableData& t = reg.tables[name];
+        const DWORD now = GetTickCount();
+        if (t.loaded && !force && now - t.lastCheck < 2000) return t;
+        t.lastCheck = now;
+
+        const std::wstring dir = tablesDirectory(false);
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        std::wstring path;
+        if (!dir.empty() && validTableName(name)) {
+            pfc::stringcvt::string_wide_from_utf8 wide(name.c_str());
+            path = dir + wide.get_ptr() + L".json";
+        }
+        if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) {
+            t.map.clear();
+            t.separators.clear();
+            t.fields.clear();
+            t.state = 1;
+            t.stamp = FILETIME{};
+            t.loaded = true;
+            return t;
+        }
+        if (t.loaded && CompareFileTime(&fad.ftLastWriteTime, &t.stamp) == 0) return t;
+
+        std::string data;
+        std::unordered_map<std::string, std::string> map;
+        std::vector<std::string> separators, fields;
+        if (readTableFile(path, data) && parseTableJson(data, map, separators, fields)) {
+            t.map.swap(map);
+            t.separators.swap(separators);
+            t.fields.swap(fields);
+            t.state = 0;
+        }
+        else {
+            t.map.clear();
+            t.separators.clear();
+            t.fields.clear();
+            t.state = 2;
+        }
+        t.stamp = fad.ftLastWriteTime;
+        t.loaded = true;
+        return t;
+    }
+
+    // 0 = table usable, 1 = file missing, 2 = file not valid. Re-reads the file if it changed.
+    int tableState(const std::string& name) {
+        TableRegistry& reg = tableRegistry();
+        std::lock_guard<std::mutex> lock(reg.m);
+        return refreshTable(reg, name, true).state;
+    }
+
+    std::vector<std::string> tableFields(const std::string& name) {
+        if (name.empty()) return {};
+        TableRegistry& reg = tableRegistry();
+        std::lock_guard<std::mutex> lock(reg.m);
+        const TableData& t = refreshTable(reg, name, false);
+        return t.state == 0 ? t.fields : std::vector<std::string>();
+    }
+
+    bool lookupFolded(const TableData& t, const std::string& text, std::string& replacement) {
+        const auto it = t.map.find(foldCase(text));
+        if (it == t.map.end()) return false;
+        replacement = it->second;
+        return true;
+    }
+
+    // Replaces `value` using the table (whole value, case-insensitive). When the table has a
+    // "$split" entry (default: ";"), a value that is not found as a whole is split at those
+    // separators (e.g. "A;B", "A; B" or "A, B") and every name is replaced on its own. A run of several parts is tried
+    // first (longest first), so names that contain a separator ("Earth, Wind & Fire") still match.
+    // The original separators and surrounding spaces are kept.
+    void applyTable(const std::string& name, std::string& value) {
+        if (name.empty() || value.empty()) return;
+        TableRegistry& reg = tableRegistry();
+        std::lock_guard<std::mutex> lock(reg.m);
+        TableData& t = refreshTable(reg, name, false);
+        if (t.state != 0) return;
+
+        std::string hit;
+        if (lookupFolded(t, value, hit)) {
+            value = hit;
+            return;
+        }
+        if (t.separators.empty()) return;
+
+        std::vector<std::pair<size_t, size_t>> parts;  // [begin, end) of every name
+        size_t begin = 0, pos = 0;
+        while (pos < value.size()) {
+            size_t sepLen = 0;
+            for (const std::string& sep : t.separators)
+                if (sep.size() > sepLen && value.compare(pos, sep.size(), sep) == 0) sepLen = sep.size();
+            if (sepLen > 0) {
+                parts.emplace_back(begin, pos);
+                pos += sepLen;
+                begin = pos;
+            }
+            else {
+                ++pos;
+            }
+        }
+        parts.emplace_back(begin, value.size());
+        if (parts.size() < 2) return;
+
+        const size_t kMaxRun = 6;
+        std::string out;
+        bool changed = false;
+        size_t i = 0;
+        while (i < parts.size()) {
+            size_t next = i + 1;
+            bool matched = false;
+            for (size_t j = (std::min)(parts.size(), i + kMaxRun); j > i && !matched; --j) {
+                const size_t origBegin = parts[i].first, origEnd = parts[j - 1].second;
+                size_t b = origBegin, e = origEnd;
+                while (b < e && (value[b] == ' ' || value[b] == '\t')) ++b;
+                while (e > b && (value[e - 1] == ' ' || value[e - 1] == '\t')) --e;
+                std::string replacement;
+                if (b < e && lookupFolded(t, value.substr(b, e - b), replacement)) {
+                    out.append(value, origBegin, b - origBegin);
+                    out += replacement;
+                    out.append(value, e, origEnd - e);
+                    matched = true;
+                    changed = true;
+                    next = j;
+                }
+            }
+            if (!matched) out.append(value, parts[i].first, parts[i].second - parts[i].first);
+            if (next < parts.size()) out.append(value, parts[next - 1].second, parts[next].first - parts[next - 1].second);
+            i = next;
+        }
+        if (changed) value = out;
+    }
+
+    // Formats `h` with a slot script: live stream metadata for the playing track and, when the
+    // slot has a replacement table, value-by-value replacement of the table's multi-value fields.
+    void formatSlot(metadb_handle* h, const titleformat_object::ptr& script, const std::string& table, pfc::string8& out) {
+        MetaList overlay;
+        const bool live = dynamicOverlayFor(h, overlay);
+        metadb_info_container::ptr info;
+        if (!table.empty()) h->get_info_ref(info);  // not available until the file has been scanned
+        if (live || info.is_valid()) {
+            slot_hook hook(std::move(overlay), info, table);
+            h->format_title(&hook, out, script, nullptr);
+        }
+        else {
+            h->format_title(nullptr, out, script, nullptr);
+        }
+    }
+
     // Evaluates one slot for one track. A slot that is already being evaluated on this thread
     // (a reference cycle) returns an empty string.
-    std::string evalSlot(metadb_handle* h, size_t slot) {
-        thread_local unsigned inProgress = 0;
-        const unsigned bit = 1u << slot;
-        if (inProgress & bit) return {};
+    std::string evalSlot(metadb_handle* h, std::uint32_t id) {
+        thread_local std::vector<std::uint32_t> inProgress;
+        if (std::find(inProgress.begin(), inProgress.end(), id) != inProgress.end()) return {};
 
         std::string value;
-        titleformat_object::ptr script = compileScript(slot);
+        const CompiledSlot compiled = compileScript(id);
+        const titleformat_object::ptr& script = compiled.obj;
         if (script.is_valid()) {
-            struct Guard { unsigned& flags; unsigned b; ~Guard() { flags &= ~b; } } guard{ inProgress, bit };
-            inProgress |= bit;
+            struct Guard { std::vector<std::uint32_t>& list; ~Guard() { list.pop_back(); } } guard{ inProgress };
+            inProgress.push_back(id);
             pfc::string8 result;
-            formatTrack(h, result, script);
+            formatSlot(h, script, compiled.table, result);
             value = result.c_str();
+            applyTable(compiled.table, value);
         }
         return value;
     }
 
+    // The fields foobar2000 knows, fixed when it first asks (at startup). A slot is found by its
+    // id, so edits keep working under the registered name; added, renamed or removed fields need
+    // a restart.
+    struct RegisteredFields {
+        std::vector<std::uint32_t> ids;
+        std::vector<std::string> names;
+    };
+
+    const RegisteredFields& registeredFields() {
+        static const RegisteredFields registered = [] {
+            RegisteredFields r;
+            std::vector<std::string> names;
+            for (const SlotData& slot : savedSlots()) {
+                r.ids.push_back(slot.id);
+                names.push_back(slot.name);
+            }
+            r.names = fieldNames(names);
+            return r;
+            }();
+        return registered;
+    }
+
     class tf_fields : public metadb_display_field_provider {
     public:
-        t_uint32 get_field_count() override { return (t_uint32)kSlots; }
+        t_uint32 get_field_count() override { return (t_uint32)registeredFields().ids.size(); }
 
         void get_field_name(t_uint32 index, pfc::string_base& out) override {
-            if (index >= kSlots) { out.reset(); return; }
-            out.set_string(fieldNameFor(index, nullptr).c_str());
+            const RegisteredFields& r = registeredFields();
+            if (index >= r.names.size()) { out.reset(); return; }
+            out.set_string(r.names[index].c_str());
         }
 
         bool process_field(t_uint32 index, metadb_handle* handle, titleformat_text_out* out) override {
-            if (index >= kSlots) return false;
-            const std::string value = evalSlot(handle, index);
+            const RegisteredFields& r = registeredFields();
+            if (index >= r.ids.size()) return false;
+            const std::string value = evalSlot(handle, r.ids[index]);
             if (value.empty()) return false;
             out->write(titleformat_inputtypes::meta, value.c_str(), value.length());
             return true;
@@ -489,11 +1162,11 @@ namespace {
         { "script_label", "Titleformat script:" },
         { "use_in_tf", "Use in title formatting:" },
         { "note_1", "Scripts may use other slots (%tf_artist%); circular references are refused when you press Apply." },
-        { "note_3", "Changing a tag name asks to restart foobar2000 when you press Apply; script changes apply at once." },
+        { "note_3", "Adding, renaming or removing a tag asks to restart foobar2000 when you press Apply; script changes apply at once." },
         { "cycle_apply", "Circular reference between slots: {0}\n\nNothing was applied. Remove the reference and press Apply again." },
         { "cycle_test", "Circular reference between slots: {0}" },
         { "broken_scripts", "These scripts do not compile, so their fields will be empty:{0}\n\nApply anyway?" },
-        { "restart_prompt", "A tag name was changed. foobar2000 reads field names at startup, so the new names only take effect after a restart.\n\nRestart foobar2000 now?" },
+        { "restart_prompt", "The list of tag names changed. foobar2000 reads field names at startup, so added, renamed or removed fields only take effect after a restart.\n\nRestart foobar2000 now?" },
         { "test_no_track", "Select a track in the playlist (or start playback) and try again." },
         { "test_empty_script", "(empty script or the script does not compile)" },
         { "test_empty_result", "(empty result)" },
@@ -507,10 +1180,18 @@ namespace {
         { "export_title", "Export settings" },
         { "filter_settings", "TF Tags settings (*.tftags)" },
         { "filter_all", "All files (*.*)" },
-        { "import_confirm", "Replace the tag names and scripts of the slots in this file with the imported settings?\n\nThey are applied when you press Apply." },
+        { "import_confirm", "Add the slots in this file to the page? A slot with the same tag name is replaced.\n\nThey are applied when you press Apply." },
+        { "import_empty", "The file has no slots with a script." },
+        { "add_slot", "Add" },
+        { "remove_slot", "Remove" },
+        { "remove_confirm", "Remove the slot {0}?\n\nThe field stops working after you apply the change and restart foobar2000." },
         { "import_invalid", "This is not a TF Tags settings file." },
         { "import_failed", "The settings file could not be read." },
         { "export_failed", "The settings file could not be written." },
+        { "table_label", "Replacement table:" },
+        { "table_none", "(none)" },
+        { "table_folder", "Open folder" },
+        { "table_error", "The replacement table \"{0}\" is missing or is not valid." },
         { "lang_label", "Language:" },
         { "lang_auto", "Automatic (Windows display language)" },
         { "btn_yes", "Yes" },
@@ -728,9 +1409,32 @@ namespace {
         return sysDpi > 0 ? (UINT)sysDpi : 96;
     }
 
+    // Explicit dark colors for edit boxes and list boxes. Relying only on foobar2000's dark-mode
+    // hooks left black text on a dark background where they are not fully supported (Wine).
+    constexpr COLORREF kDarkEditText = RGB(240, 240, 240);
+    constexpr COLORREF kDarkEditBack = RGB(45, 45, 45);
+
+
+    HBRUSH darkEditBrush() {
+        static HBRUSH brush = CreateSolidBrush(kDarkEditBack);
+        return brush;
+    }
+
     HFONT createMonoFont(int lfHeight) {
         return CreateFontW(lfHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    }
+
+    COLORREF contrastingTextColor(COLORREF background) {
+        const int r = GetRValue(background);
+        const int g = GetGValue(background);
+        const int b = GetBValue(background);
+
+        const int brightness = (r * 299 + g * 587 + b * 114) / 1000;
+
+        return brightness < 128
+            ? RGB(240, 240, 240)
+            : RGB(0, 0, 0);
     }
 
     // Modal Yes/No or OK box that follows foobar2000's dark mode (MessageBox does not).
@@ -895,9 +1599,19 @@ namespace {
             }
             case WM_CTLCOLORSTATIC: {
                 HDC dc = reinterpret_cast<HDC>(wp);
-                if (dark) SetTextColor(dc, RGB(240, 240, 240));
+
+                HBRUSH brush = dark
+                    ? m_brDark
+                    : GetSysColorBrush(COLOR_BTNFACE);
+
+                const COLORREF background = dark
+                    ? RGB(32, 32, 32)
+                    : GetSysColor(COLOR_BTNFACE);
+
+                SetTextColor(dc, contrastingTextColor(background));
                 SetBkMode(dc, TRANSPARENT);
-                return reinterpret_cast<LRESULT>(dark ? m_brDark : GetSysColorBrush(COLOR_BTNFACE));
+
+                return reinterpret_cast<LRESULT>(brush);
             }
             case WM_COMMAND: {
                 int id = LOWORD(wp);
@@ -974,7 +1688,6 @@ namespace {
         static constexpr int ID_EDIT = 101;
         static constexpr int ID_PREVIEW = 102;
         static constexpr UINT_PTR TIMER_PREVIEW = 1;
-        static constexpr UINT_PTR TIMER_WATCH = 2;
 
         script_editor(HWND owner, const std::string& title, const std::string& text, PreviewFn preview) :
             m_owner(owner), m_initial(withCrLf(text)), m_preview(std::move(preview)),
@@ -1038,7 +1751,7 @@ namespace {
             const int x = (std::max)((int)work.left, (int)(anchor.left + ((anchor.right - anchor.left) - w) / 2));
             const int y = (std::max)((int)work.top, (int)(anchor.top + ((anchor.bottom - anchor.top) - h) / 2));
 
-            m_wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"foo_tftags_editor", m_title.c_str(),
+            m_wnd = CreateWindowExW(0, L"foo_tftags_editor", m_title.c_str(),
                 WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX,
                 x, y, w, h, m_owner, nullptr, core_api::get_my_instance(), this);
             if (!m_wnd) {
@@ -1047,9 +1760,6 @@ namespace {
                 return false;
             }
 
-            registerPreviewWindow(m_wnd);
-            m_lastTrack = pickPreviewTrack();
-            SetTimer(m_wnd, TIMER_WATCH, kTrackWatchMs, nullptr);
             pfc::stringcvt::string_wide_from_utf8 initial(m_initial.c_str());
             m_edit = addChild(L"EDIT", initial.get_ptr(),
                 WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
@@ -1084,8 +1794,6 @@ namespace {
             }
 
             KillTimer(m_wnd, TIMER_PREVIEW);
-            KillTimer(m_wnd, TIMER_WATCH);
-            unregisterPreviewWindow(m_wnd);
             if (m_owner) EnableWindow(m_owner, TRUE);
             DestroyWindow(m_wnd);
             m_wnd = nullptr;
@@ -1143,9 +1851,37 @@ namespace {
             }
             case WM_CTLCOLORSTATIC: {
                 HDC dc = reinterpret_cast<HDC>(wp);
-                if (dark) SetTextColor(dc, RGB(240, 240, 240));
+
+                HBRUSH brush = dark
+                    ? m_brDark
+                    : GetSysColorBrush(COLOR_BTNFACE);
+
+                const COLORREF background = dark
+                    ? RGB(32, 32, 32)
+                    : GetSysColor(COLOR_BTNFACE);
+
+                SetTextColor(dc, contrastingTextColor(background));
                 SetBkMode(dc, TRANSPARENT);
-                return reinterpret_cast<LRESULT>(dark ? m_brDark : GetSysColorBrush(COLOR_BTNFACE));
+
+                return reinterpret_cast<LRESULT>(brush);
+            }
+            case WM_CTLCOLOREDIT:
+            case WM_CTLCOLORLISTBOX: {
+                HDC dc = reinterpret_cast<HDC>(wp);
+
+                const COLORREF back = dark
+                    ? kDarkEditBack
+                    : GetSysColor(COLOR_WINDOW);
+
+                SetTextColor(dc, dark
+                    ? kDarkEditText
+                    : GetSysColor(COLOR_WINDOWTEXT));
+
+                SetBkColor(dc, back);
+
+                return reinterpret_cast<LRESULT>(
+                    dark ? darkEditBrush() : GetSysColorBrush(COLOR_WINDOW)
+                    );
             }
             case WM_SIZE:
                 if (m_edit && wp != SIZE_MINIMIZED) layout();
@@ -1177,18 +1913,7 @@ namespace {
                     updatePreview();
                     return 0;
                 }
-                if (wp == TIMER_WATCH) {
-                    const metadb_handle_ptr track = pickPreviewTrack();
-                    if (track.get_ptr() != m_lastTrack.get_ptr()) {
-                        m_lastTrack = track;
-                        updatePreview();
-                    }
-                    return 0;
-                }
                 break;
-            case WM_TFTAGS_REFRESH_PREVIEW:
-                updatePreview();
-                return 0;
             case WM_CLOSE:
                 tryCancel();
                 return 0;
@@ -1203,7 +1928,6 @@ namespace {
         HBRUSH m_brDark;
         HWND m_wnd = nullptr, m_edit = nullptr, m_previewLabel = nullptr, m_previewBox = nullptr, m_ok = nullptr, m_cancel = nullptr;
         HFONT m_font = nullptr, m_mono = nullptr;
-        metadb_handle_ptr m_lastTrack;
         UINT m_dpi = 96;
         std::string m_resultText;
         bool m_accepted = false;
@@ -1230,19 +1954,22 @@ namespace {
     constexpr int ID_NAME = 2002;
     constexpr int ID_SCRIPT = 2003;
     constexpr int ID_PREVIEW_TIMER = 2004;  // delayed preview while typing
-    constexpr int ID_WATCH_TIMER = 2005;    // follows the selected track
     constexpr int ID_RESULT = 2005;
     constexpr int ID_LANG = 2006;
     constexpr int ID_EDITOR = 2007;
     constexpr int ID_IMPORT = 2008;
     constexpr int ID_EXPORT = 2009;
+    constexpr int ID_TABLE = 2010;
+    constexpr int ID_TABLEDIR = 2011;
+    constexpr int ID_ADD = 2012;
+    constexpr int ID_REMOVE = 2013;
 
     class tftags_preferences_instance : public preferences_page_instance {
     public:
         tftags_preferences_instance(HWND parent, preferences_page_callback::ptr callback)
             : m_callback(callback), m_wnd(nullptr), m_ready(false), m_current(0),
             m_list(nullptr), m_nameLabel(nullptr), m_hint(nullptr), m_field(nullptr), m_scriptLabel(nullptr),
-            m_name(nullptr), m_script(nullptr), m_result(nullptr), m_note(nullptr), m_langLabel(nullptr), m_langCombo(nullptr), m_previewLabel(nullptr), m_scriptButton(nullptr), m_importButton(nullptr), m_exportButton(nullptr),
+            m_name(nullptr), m_script(nullptr), m_result(nullptr), m_note(nullptr), m_langLabel(nullptr), m_langCombo(nullptr), m_previewLabel(nullptr), m_scriptButton(nullptr), m_importButton(nullptr), m_exportButton(nullptr), m_tableLabel(nullptr), m_tableCombo(nullptr), m_tableFolder(nullptr), m_addButton(nullptr), m_removeButton(nullptr),
             m_uiFont(nullptr), m_monoFont(nullptr), m_brDark(CreateSolidBrush(RGB(32, 32, 32))) {
 
             HINSTANCE hInstance = core_api::get_my_instance();
@@ -1264,13 +1991,14 @@ namespace {
             m_wnd = CreateWindowExW(0, L"TfTagsPreferencesPage", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
                 0, 0, initW, initH, parent, nullptr, hInstance, this);
             if (!m_wnd) return;
-            registerPreviewWindow(m_wnd);
-            m_lastTrack = pickPreviewTrack();
-            SetTimer(m_wnd, ID_WATCH_TIMER, kTrackWatchMs, nullptr);
 
-            for (size_t i = 0; i < kSlots; ++i) {
-                m_names[i] = g_slots[i].name.get() ? g_slots[i].name.get() : "";
-                m_scripts[i] = g_slots[i].script.get() ? g_slots[i].script.get() : "";
+            m_saved = savedSlots();
+            for (const SlotData& slot : m_saved) {
+                m_ids.push_back(slot.id);
+                m_names.push_back(slot.name);
+                m_scripts.push_back(withCrLf(slot.script));
+                m_tables.push_back(slot.table);
+                m_nextId = (std::max)(m_nextId, slot.id + 1);
             }
 
             m_baseDpi = baseUiFont(m_wnd, m_baseLf);
@@ -1280,6 +2008,12 @@ namespace {
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
                 0, 0, 10, 10, m_wnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_LIST)), hInstance, nullptr);
             setFont(m_list, uiFont());
+            m_addButton = CreateWindowExW(0, L"BUTTON", trw("add_slot").c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0, 0, 10, 10, m_wnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_ADD)), hInstance, nullptr);
+            setFont(m_addButton, uiFont());
+            m_removeButton = CreateWindowExW(0, L"BUTTON", trw("remove_slot").c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0, 0, 10, 10, m_wnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_REMOVE)), hInstance, nullptr);
+            setFont(m_removeButton, uiFont());
 
             m_nameLabel = addLabel(trw("name_label").c_str());
             m_name = addEdit(ID_NAME, false);
@@ -1315,10 +2049,16 @@ namespace {
             m_exportButton = CreateWindowExW(0, L"BUTTON", trw("export_button").c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                 0, 0, 10, 10, m_wnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_EXPORT)), hInstance, nullptr);
             setFont(m_exportButton, uiFont());
+            m_tableLabel = addLabel(trw("table_label").c_str());
+            m_tableCombo = CreateWindowExW(0, L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+                0, 0, 10, 10, m_wnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TABLE)), hInstance, nullptr);
+            setFont(m_tableCombo, uiFont());
+            m_tableFolder = CreateWindowExW(0, L"BUTTON", trw("table_folder").c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                0, 0, 10, 10, m_wnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_TABLEDIR)), hInstance, nullptr);
+            setFont(m_tableFolder, uiFont());
+            fillTableCombo();
 
-            for (size_t i = 0; i < kSlots; ++i) SendMessageW(m_list, LB_ADDSTRING, 0, 0);
             refreshList();
-            SendMessageW(m_list, LB_SETCURSEL, 0, 0);
             loadCurrent();
 
             m_darkMode.AddDialogWithControls(m_wnd);
@@ -1349,30 +2089,37 @@ namespace {
                 themed_message::show(GetAncestor(m_wnd, GA_ROOT), "TF Tags", msg, false, false, IDI_WARNING);
                 return;
             }
+            const std::vector<std::string> newFields = fieldNames(m_names);
             std::string broken;
-            for (size_t i = 0; i < kSlots; ++i) {
+            for (size_t i = 0; i < m_scripts.size(); ++i) {
                 const std::string flat = flattenScript(m_scripts[i]);
                 titleformat_object::ptr obj;
                 if (!flat.empty() && !titleformat_compiler::get()->compile(obj, flat.c_str()))
-                    broken += "\n    %" + fieldNameFor(i, m_names) + "%";
+                    broken += "\n    %" + newFields[i] + "%";
             }
             if (!broken.empty()) {
                 const std::string msg = trf("broken_scripts", broken);
                 if (themed_message::show(GetAncestor(m_wnd, GA_ROOT), "TF Tags", msg, true, true, IDI_WARNING) != IDYES) return;
             }
 
-            std::string fieldsBefore[kSlots];
-            for (size_t i = 0; i < kSlots; ++i) fieldsBefore[i] = fieldNameFor(i, nullptr);
-            bool scriptsChanged = false;
-            for (size_t i = 0; i < kSlots; ++i) {
-                const char* old = g_slots[i].script.get();
-                if (m_scripts[i] != (old ? old : "")) scriptsChanged = true;
+            const std::vector<std::string> fieldsBefore = savedFieldNames();
+            std::vector<SlotData> updated;
+            for (size_t i = 0; i < m_ids.size(); ++i) {
+                SlotData slot;
+                slot.id = m_ids[i];
+                slot.name = cleanName(m_names[i]);
+                slot.script = stripCr(m_scripts[i]);
+                slot.table = m_tables[i];
+                m_names[i] = slot.name;
+                updated.push_back(slot);
             }
-            for (size_t i = 0; i < kSlots; ++i) {
-                g_slots[i].name = cleanName(m_names[i]).c_str();
-                m_names[i] = cleanName(m_names[i]);
+            bool scriptsChanged = updated.size() != m_saved.size();
+            for (const SlotData& slot : updated) {
+                const auto old = std::find_if(m_saved.begin(), m_saved.end(), [&](const SlotData& o) { return o.id == slot.id; });
+                if (old == m_saved.end() || old->script != slot.script || old->table != slot.table) scriptsChanged = true;
             }
-            setScripts(m_scripts);
+            setSlots(updated);
+            m_saved = updated;
             if (m_langPending != savedLanguage()) {
                 g_language = m_langPending.c_str();
                 LanguageTable& lt = languageTable();
@@ -1385,12 +2132,9 @@ namespace {
             if (m_callback.is_valid()) m_callback->on_state_changed();
             if (scriptsChanged) refreshViews();
 
-            // Field names are only read at startup, so a changed effective field name
-            // needs a restart. Settings are written on exit, so the new names survive it.
-            bool renamed = false;
-            for (size_t i = 0; i < kSlots; ++i)
-                if (fieldNameFor(i, nullptr) != fieldsBefore[i]) { renamed = true; break; }
-            if (renamed) {
+            // Field names are only read at startup, so an added, renamed or removed field needs a
+            // restart. Settings are written on exit, so the slots survive it.
+            if (savedFieldNames() != fieldsBefore) {
                 HWND owner = m_wnd ? GetAncestor(m_wnd, GA_ROOT) : nullptr;
                 const int answer = themed_message::show(owner, "TF Tags",
                     tr("restart_prompt"), true, false, IDI_QUESTION);
@@ -1404,12 +2148,11 @@ namespace {
 
         void reset() override {
             if (!m_wnd) return;
-            for (size_t i = 0; i < kSlots; ++i) {
-                std::string defaultName = std::to_string(i + 1);
-                if (defaultName.size() < 2) defaultName.insert(defaultName.begin(), '0');
-                m_names[i] = defaultName;
-                m_scripts[i].clear();
-            }
+            m_ids.assign(1, m_nextId++);
+            m_names.assign(1, "01");
+            m_scripts.assign(1, std::string());
+            m_tables.assign(1, std::string());
+            m_current = 0;
             m_langPending.clear();
             fillLanguageCombo();
             loadCurrent();
@@ -1451,6 +2194,37 @@ namespace {
 
         HGDIOBJ uiFont() const { return m_uiFont ? static_cast<HGDIOBJ>(m_uiFont) : GetStockObject(DEFAULT_GUI_FONT); }
 
+        // Lists the tables folder; the current slot's table stays selected even if its file is gone.
+        void fillTableCombo() {
+            if (!m_tableCombo || m_current >= m_tables.size()) return;
+            const std::string wanted = m_tables[m_current];
+            SendMessageW(m_tableCombo, CB_RESETCONTENT, 0, 0);
+            m_tableNames.assign(1, std::string());
+            auto add = [&](const std::string& text) {
+                pfc::stringcvt::string_wide_from_utf8 wide(text.c_str());
+                SendMessageW(m_tableCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.get_ptr()));
+                };
+            add(tr("table_none"));
+            for (const std::string& name : listTables()) {
+                m_tableNames.push_back(name);
+                add(name);
+            }
+            size_t pick = 0;
+            for (size_t i = 0; i < m_tableNames.size(); ++i)
+                if (m_tableNames[i] == wanted) pick = i;
+            if (pick == 0 && !wanted.empty()) {
+                m_tableNames.push_back(wanted);
+                add(wanted);
+                pick = m_tableNames.size() - 1;
+            }
+            SendMessageW(m_tableCombo, CB_SETCURSEL, pick, 0);
+        }
+
+        void openTablesFolder() {
+            const std::wstring dir = tablesDirectory(true);
+            if (!dir.empty()) ShellExecuteW(GetAncestor(m_wnd, GA_ROOT), L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        }
+
         static std::string savedLanguage() {
             const char* v = g_language.get();
             return v ? v : "";
@@ -1482,6 +2256,11 @@ namespace {
             writeWindow(m_langLabel, tr("lang_label"));
             writeWindow(m_previewLabel, tr("preview_label"));
             writeWindow(m_importButton, tr("import_button"));
+            writeWindow(m_tableLabel, tr("table_label"));
+            writeWindow(m_tableFolder, tr("table_folder"));
+            writeWindow(m_addButton, tr("add_slot"));
+            writeWindow(m_removeButton, tr("remove_slot"));
+            fillTableCombo();
             writeWindow(m_exportButton, tr("export_button"));
             writeWindow(m_note, tr("note_1") + "\n" + tr("note_3"));
             fillLanguageCombo();
@@ -1505,7 +2284,7 @@ namespace {
             if (!m_ready || !m_wnd) return;
             HFONT oldUi = m_uiFont, oldMono = m_monoFont;
             rebuildFonts();
-            for (HWND c : { m_list, m_nameLabel, m_name, m_hint, m_field, m_scriptLabel, m_result, m_note, m_langLabel, m_langCombo, m_previewLabel, m_scriptButton, m_importButton, m_exportButton })
+            for (HWND c : { m_list, m_nameLabel, m_name, m_hint, m_field, m_scriptLabel, m_result, m_note, m_langLabel, m_langCombo, m_previewLabel, m_scriptButton, m_importButton, m_exportButton, m_tableLabel, m_tableCombo, m_tableFolder, m_addButton, m_removeButton })
                 if (c) setFont(c, uiFont());
             if (m_script) setFont(m_script, m_monoFont ? static_cast<HGDIOBJ>(m_monoFont) : uiFont());
             if (oldUi) DeleteObject(oldUi);
@@ -1548,9 +2327,13 @@ namespace {
         }
 
         void storeCurrent() {
-            if (m_current >= kSlots) return;
+            if (m_current >= m_names.size()) return;
             m_names[m_current] = readWindow(m_name);
             m_scripts[m_current] = readWindow(m_script);
+            if (m_tableCombo && !m_tableNames.empty()) {
+                const int sel = (int)SendMessageW(m_tableCombo, CB_GETCURSEL, 0, 0);
+                if (sel >= 0 && (size_t)sel < m_tableNames.size()) m_tables[m_current] = m_tableNames[(size_t)sel];
+            }
         }
 
         void updateHint() {
@@ -1563,21 +2346,25 @@ namespace {
             writeWindow(m_name, m_names[m_current]);
             writeWindow(m_script, m_scripts[m_current]);
             m_loading = false;
+            fillTableCombo();
             updateHint();
         }
 
         void refreshList() {
-            const int sel = (int)SendMessageW(m_list, LB_GETCURSEL, 0, 0);
+            const int top = (int)SendMessageW(m_list, LB_GETTOPINDEX, 0, 0);
             SendMessageW(m_list, WM_SETREDRAW, FALSE, 0);
-            for (size_t i = 0; i < kSlots; ++i) {
-                std::string slotNumber = std::to_string(i + 1);
-                if (slotNumber.size() < 2) slotNumber.insert(slotNumber.begin(), '0');
-                const std::string text = slotNumber + "   %" + fieldNameFor(i, m_names) + "%";
+            SendMessageW(m_list, LB_RESETCONTENT, 0, 0);
+            const std::vector<std::string> fields = fieldNames(m_names);
+            const size_t digits = (std::max)((size_t)2, std::to_string(m_names.size()).size());
+            for (size_t i = 0; i < m_names.size(); ++i) {
+                std::string number = std::to_string(i + 1);
+                while (number.size() < digits) number.insert(number.begin(), '0');
+                const std::string text = number + "   %" + fields[i] + "%";
                 pfc::stringcvt::string_wide_from_utf8 wide(text.c_str());
-                SendMessageW(m_list, LB_DELETESTRING, i, 0);
-                SendMessageW(m_list, LB_INSERTSTRING, i, reinterpret_cast<LPARAM>(wide.get_ptr()));
+                SendMessageW(m_list, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(wide.get_ptr()));
             }
-            SendMessageW(m_list, LB_SETCURSEL, sel < 0 ? 0 : sel, 0);
+            SendMessageW(m_list, LB_SETCURSEL, m_current < m_names.size() ? m_current : 0, 0);
+            if (top > 0) SendMessageW(m_list, LB_SETTOPINDEX, top, 0);
             SendMessageW(m_list, WM_SETREDRAW, TRUE, 0);
             InvalidateRect(m_list, nullptr, TRUE);
         }
@@ -1585,33 +2372,103 @@ namespace {
         bool hasChanges() {
             storeCurrent();
             if (m_langPending != savedLanguage()) return true;
-            for (size_t i = 0; i < kSlots; ++i) {
-                const char* n = g_slots[i].name.get();
-                const char* s = g_slots[i].script.get();
-                if (cleanName(m_names[i]) != cleanName(n ? n : "")) return true;
-                if (m_scripts[i] != (s ? s : "")) return true;
+            if (m_ids.size() != m_saved.size()) return true;
+            for (size_t i = 0; i < m_ids.size(); ++i) {
+                const SlotData& saved = m_saved[i];
+                if (m_ids[i] != saved.id) return true;
+                if (cleanName(m_names[i]) != cleanName(saved.name)) return true;
+                if (stripCr(m_scripts[i]) != saved.script) return true;
+                if (m_tables[i] != saved.table) return true;
             }
             return false;
+        }
+
+        // Next unused two-digit tag name: 01, 02, ...
+        std::string defaultSlotName() const {
+            for (size_t n = 1;; ++n) {
+                std::string name = std::to_string(n);
+                if (name.size() < 2) name.insert(name.begin(), '0');
+                bool used = false;
+                for (const std::string& existing : m_names)
+                    if (cleanName(existing) == name) { used = true; break; }
+                if (!used) return name;
+            }
+        }
+
+        void addSlot() {
+            storeCurrent();
+            m_ids.push_back(m_nextId++);
+            m_names.push_back(defaultSlotName());
+            m_scripts.emplace_back();
+            m_tables.emplace_back();
+            m_current = m_names.size() - 1;
+            refreshList();
+            loadCurrent();
+            if (m_callback.is_valid()) m_callback->on_state_changed();
+            runTest();
+            SetFocus(m_name);
+            SendMessageW(m_name, EM_SETSEL, 0, -1);
+        }
+
+        void removeSlot() {
+            storeCurrent();
+            if (m_current >= m_names.size()) return;
+            const std::string field = "%" + fieldNameFor(m_current, m_names) + "%";
+            if (themed_message::show(GetAncestor(m_wnd, GA_ROOT), "TF Tags", trf("remove_confirm", field), true, true, IDI_QUESTION) != IDYES) return;
+            const std::ptrdiff_t at = (std::ptrdiff_t)m_current;
+            m_ids.erase(m_ids.begin() + at);
+            m_names.erase(m_names.begin() + at);
+            m_scripts.erase(m_scripts.begin() + at);
+            m_tables.erase(m_tables.begin() + at);
+            if (m_names.empty()) {  // there is always at least one slot
+                m_ids.push_back(m_nextId++);
+                m_names.push_back("01");
+                m_scripts.emplace_back();
+                m_tables.emplace_back();
+            }
+            if (m_current >= m_names.size()) m_current = m_names.size() - 1;
+            refreshList();
+            loadCurrent();
+            if (m_callback.is_valid()) m_callback->on_state_changed();
+            runTest();
         }
 
         // Evaluates a script for the selected track and returns the text for a preview box.
         // `script` replaces the current slot's script (other slots use their saved scripts).
         std::string previewFor(const std::string& script) {
-            std::string scripts[kSlots];
-            for (size_t i = 0; i < kSlots; ++i) scripts[i] = m_scripts[i];
-            scripts[m_current] = script;
+            std::vector<std::string> scripts = m_scripts;
+            if (m_current < scripts.size()) scripts[m_current] = script;
             const std::string cycle = findCycle(m_names, scripts);
             if (!cycle.empty()) return trf("cycle_test", cycle);
 
-            const metadb_handle_ptr track = pickPreviewTrack();
+            // A selected track always wins, even while another track is playing: the active playlist
+            // selection first, then the selection of any other panel (e.g. the library), then the
+            // focused playlist row. The playing track is only used when none of these exist.
+            metadb_handle_ptr playing;
+            playback_control::get()->get_now_playing(playing);
+
+            metadb_handle_ptr track;
+            metadb_handle_list sel;
+            playlist_manager::get()->activeplaylist_get_selected_items(sel);
+            if (sel.get_count() == 0) ui_selection_manager::get()->get_selection(sel);
+            if (sel.get_count() > 0) track = sel[0];
+            else {
+                metadb_handle_ptr focused;
+                if (playlist_manager::get()->activeplaylist_get_focus_item_handle(focused) && focused.is_valid()) track = focused;
+                else track = playing;
+            }
             if (track.is_empty()) return tr("test_no_track");
 
             const std::string flat = flattenScript(script);
             titleformat_object::ptr obj;
             if (flat.empty() || !titleformat_compiler::get()->compile(obj, flat.c_str())) return tr("test_empty_script");
+            const std::string& table = m_tables[m_current];
+            if (!table.empty() && tableState(table) != 0) return trf("table_error", table);
             pfc::string8 out;
-            formatTrack(track.get_ptr(), out, obj);
-            return out.is_empty() ? tr("test_empty_result") : std::string(out.c_str());
+            formatSlot(track.get_ptr(), obj, table, out);
+            std::string result = out.c_str();
+            applyTable(table, result);
+            return result.empty() ? tr("test_empty_result") : result;
         }
 
         // Fills the Preview box for the current slot.
@@ -1673,9 +2530,10 @@ namespace {
             if (!pickSettingsFile(true, path)) return;
             std::string data = "# TF Tags settings\n";
             data += "format=foo_tftags-settings-1\n";
-            for (size_t i = 0; i < kSlots; ++i) {
+            for (size_t i = 0; i < m_names.size(); ++i) {
                 data += slotKey("name", i) + "=" + escapeValue(cleanName(m_names[i])) + "\n";
                 data += slotKey("script", i) + "=" + escapeValue(m_scripts[i]) + "\n";
+                data += slotKey("table", i) + "=" + escapeValue(m_tables[i]) + "\n";
             }
             FILE* f = nullptr;
             const bool ok = _wfopen_s(&f, path.c_str(), L"wb") == 0 && f
@@ -1684,7 +2542,12 @@ namespace {
             if (!ok) themed_message::show(GetAncestor(m_wnd, GA_ROOT), "TF Tags", tr("export_failed"), false, false, IDI_WARNING);
         }
 
-        // Loads names and scripts into the page; they take effect when Apply is pressed.
+        struct ImportedSlot {
+            std::string name, script, table;
+        };
+
+        // Merges the slots of a settings file into the page: a slot with the same tag name is
+        // replaced, the others are added. Nothing takes effect until Apply is pressed.
         void importSettings() {
             std::wstring path;
             if (!pickSettingsFile(false, path)) return;
@@ -1701,14 +2564,47 @@ namespace {
                 themed_message::show(owner, "TF Tags", tr("import_invalid"), false, false, IDI_WARNING);
                 return;
             }
+
+            std::map<unsigned long, ImportedSlot> found;  // by the number in the key
+            for (const auto& entry : table) {
+                const std::string& key = entry.first;
+                const size_t dot = key.find('.');
+                if (dot == std::string::npos) continue;
+                const std::string field = key.substr(0, dot);
+                if (field != "name" && field != "script" && field != "table") continue;
+                char* end = nullptr;
+                const unsigned long number = strtoul(key.c_str() + dot + 1, &end, 10);
+                if (number == 0 || !end || *end != '\0') continue;
+                ImportedSlot& slot = found[number];
+                if (field == "name") slot.name = cleanName(entry.second);
+                else if (field == "script") slot.script = withCrLf(entry.second);
+                else slot.table = entry.second;
+            }
+            size_t usable = 0;
+            for (const auto& entry : found)
+                if (!entry.second.script.empty() || !entry.second.table.empty()) ++usable;
+            if (usable == 0) {
+                themed_message::show(owner, "TF Tags", tr("import_empty"), false, false, IDI_WARNING);
+                return;
+            }
             if (themed_message::show(owner, "TF Tags", tr("import_confirm"), true, false, IDI_QUESTION) != IDYES) return;
 
             storeCurrent();
-            for (size_t i = 0; i < kSlots; ++i) {
-                const auto name = table.find(slotKey("name", i));
-                const auto script = table.find(slotKey("script", i));
-                if (name != table.end()) m_names[i] = cleanName(name->second);
-                if (script != table.end()) m_scripts[i] = withCrLf(script->second);
+            for (const auto& entry : found) {
+                const ImportedSlot& slot = entry.second;
+                if (slot.script.empty() && slot.table.empty()) continue;  // an unused slot of an older file
+                size_t target = m_names.size();
+                if (!slot.name.empty())
+                    for (size_t i = 0; i < m_names.size(); ++i)
+                        if (cleanName(m_names[i]) == slot.name) { target = i; break; }
+                if (target == m_names.size()) {
+                    m_ids.push_back(m_nextId++);
+                    m_names.push_back(slot.name.empty() ? defaultSlotName() : slot.name);
+                    m_scripts.emplace_back();
+                    m_tables.emplace_back();
+                }
+                m_scripts[target] = slot.script;
+                m_tables[target] = slot.table;
             }
             loadCurrent();
             refreshList();
@@ -1777,7 +2673,10 @@ namespace {
             place(m_langCombo, margin + langLabelW + gap, bottom - rowH, (std::min)(S(260), (std::max)(S(100), comboRoom)), rowH + S(200));
             place(m_note, margin, bottom - rowH - gap - noteH, w - 2 * margin, noteH);
             const int contentBottom = bottom - rowH - gap - noteH - gap;
-            place(m_list, margin, margin, listW, (std::max)(S(60), contentBottom - margin));
+            const int halfW = (listW - gap) / 2;
+            place(m_addButton, margin, contentBottom - rowH, halfW, rowH);
+            place(m_removeButton, margin + halfW + gap, contentBottom - rowH, listW - halfW - gap, rowH);
+            place(m_list, margin, margin, listW, (std::max)(S(60), contentBottom - margin - rowH - gap));
 
             int y = margin;
             place(m_nameLabel, rightX, y, rightW, labelH); y += labelH + S(2);
@@ -1787,6 +2686,21 @@ namespace {
             const int hintW = textWidth(m_hint);
             place(m_hint, rightX, y + (rowH - labelH) / 2, hintW, labelH);
             place(m_field, rightX + hintW + gap, y, (std::max)(S(80), (std::min)(rightW - hintW - gap, S(260))), rowH);
+            y += rowH + gap;
+            // Replacement table row: label, table drop-down, button that opens the folder.
+            // The button keeps its place at the right edge; the label gives way before the
+            // drop-down gets narrower than 90 px, so the three never overlap.
+            const int folderW = textWidth(m_tableFolder) + S(24);
+            int tableLabelW = textWidth(m_tableLabel);
+            int tableComboW = rightW - tableLabelW - 2 * gap - folderW;
+            if (tableComboW < S(90)) {
+                tableComboW = S(90);
+                tableLabelW = (std::max)(S(40), rightW - tableComboW - 2 * gap - folderW);
+            }
+            tableComboW = (std::min)(tableComboW, S(240));
+            place(m_tableLabel, rightX, y + (rowH - labelH) / 2, tableLabelW, labelH);
+            place(m_tableCombo, rightX + tableLabelW + gap, y, tableComboW, rowH + S(200));
+            place(m_tableFolder, rightX + rightW - folderW, y, folderW, rowH);
             y += rowH + gap;
             // The "..." button opens the large editor; it sits at the right end of the label row.
             const int dotsW = S(34);
@@ -1821,10 +2735,37 @@ namespace {
                 return 1;
             }
             if (msg == WM_CTLCOLORSTATIC) {
-                HDC dc = (HDC)wp;
-                if (dark) SetTextColor(dc, RGB(240, 240, 240));
+                HDC dc = reinterpret_cast<HDC>(wp);
+
+                HBRUSH brush = dark
+                    ? m_brDark
+                    : GetSysColorBrush(COLOR_BTNFACE);
+
+                const COLORREF background = dark
+                    ? RGB(32, 32, 32)
+                    : GetSysColor(COLOR_BTNFACE);
+
+                SetTextColor(dc, contrastingTextColor(background));
                 SetBkMode(dc, TRANSPARENT);
-                return reinterpret_cast<INT_PTR>(dark ? m_brDark : GetSysColorBrush(COLOR_BTNFACE));
+
+                return reinterpret_cast<LRESULT>(brush);
+            }
+            if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX) {
+                HDC dc = reinterpret_cast<HDC>(wp);
+
+                const COLORREF back = dark
+                    ? kDarkEditBack
+                    : GetSysColor(COLOR_WINDOW);
+
+                SetTextColor(dc, dark
+                    ? kDarkEditText
+                    : GetSysColor(COLOR_WINDOWTEXT));
+
+                SetBkColor(dc, back);
+
+                return reinterpret_cast<LRESULT>(
+                    dark ? darkEditBrush() : GetSysColorBrush(COLOR_WINDOW)
+                    );
             }
             if (wnd != m_wnd) return DefWindowProcW(wnd, msg, wp, lp);
 
@@ -1839,8 +2780,22 @@ namespace {
                     runTest();
                     return 0;
                 }
+                if (id == ID_ADD && code == BN_CLICKED) { addSlot(); return 0; }
+                if (id == ID_REMOVE && code == BN_CLICKED) { removeSlot(); return 0; }
                 if (id == ID_EDITOR && code == BN_CLICKED) { openEditor(); return 0; }
                 if (id == ID_EXPORT && code == BN_CLICKED) { exportSettings(); return 0; }
+                if (id == ID_TABLEDIR && code == BN_CLICKED) { openTablesFolder(); return 0; }
+                if (id == ID_TABLE && code == CBN_DROPDOWN) {
+                    storeCurrent();
+                    fillTableCombo();  // pick up files added since the page opened
+                    return 0;
+                }
+                if (id == ID_TABLE && code == CBN_SELCHANGE) {
+                    storeCurrent();
+                    if (m_callback.is_valid()) m_callback->on_state_changed();
+                    runTest();
+                    return 0;
+                }
                 if (id == ID_IMPORT && code == BN_CLICKED) { importSettings(); return 0; }
                 if (id == ID_LANG && code == CBN_SELCHANGE) {
                     const int sel = (int)SendMessageW(m_langCombo, CB_GETCURSEL, 0, 0);
@@ -1863,20 +2818,6 @@ namespace {
                 }
             }
             if (msg == WM_APP + 1 && m_ready && !m_loading) { runTest(); return 0; }
-            if (msg == WM_TFTAGS_REFRESH_PREVIEW) {
-                if (m_ready && !m_loading) runTest();
-                return 0;
-            }
-            if (msg == WM_TIMER && wp == ID_WATCH_TIMER) {
-                if (m_ready && !m_loading) {
-                    const metadb_handle_ptr track = pickPreviewTrack();
-                    if (track.get_ptr() != m_lastTrack.get_ptr()) {
-                        m_lastTrack = track;
-                        runTest();
-                    }
-                }
-                return 0;
-            }
             if (msg == WM_TIMER && wp == ID_PREVIEW_TIMER) {
                 KillTimer(m_wnd, ID_PREVIEW_TIMER);
                 if (m_ready && !m_loading) runTest();
@@ -1888,8 +2829,6 @@ namespace {
                 InvalidateRect(m_wnd, nullptr, TRUE);
             if (msg == WM_DESTROY) {
                 KillTimer(m_wnd, ID_PREVIEW_TIMER);
-                KillTimer(m_wnd, ID_WATCH_TIMER);
-                unregisterPreviewWindow(m_wnd);
                 m_wnd = nullptr;
             }
             return DefWindowProcW(wnd, msg, wp, lp);
@@ -1900,8 +2839,12 @@ namespace {
         bool m_ready;
         bool m_loading = false;
         size_t m_current;
-        HWND m_list, m_nameLabel, m_hint, m_field, m_scriptLabel, m_name, m_script, m_result, m_note, m_langLabel, m_langCombo, m_previewLabel, m_scriptButton, m_importButton, m_exportButton;
-        metadb_handle_ptr m_lastTrack;
+        HWND m_list, m_nameLabel, m_hint, m_field, m_scriptLabel, m_name, m_script, m_result, m_note, m_langLabel, m_langCombo, m_previewLabel, m_scriptButton, m_importButton, m_exportButton, m_tableLabel, m_tableCombo, m_tableFolder, m_addButton, m_removeButton;
+        std::vector<std::string> m_names, m_scripts, m_tables;
+        std::vector<std::uint32_t> m_ids;
+        std::vector<SlotData> m_saved;  // as last saved
+        std::uint32_t m_nextId = 1;
+        std::vector<std::string> m_tableNames;
         std::string m_langPending;
         std::vector<std::string> m_langCodes;
         HFONT m_uiFont;
@@ -1909,8 +2852,6 @@ namespace {
         LOGFONTW m_baseLf{};
         UINT m_baseDpi = 96;
         HBRUSH m_brDark;
-        std::string m_names[kSlots];
-        std::string m_scripts[kSlots];
         fb2k::CCoreDarkModeHooks m_darkMode;
     };
 
